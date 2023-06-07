@@ -426,3 +426,6 @@ fn contract_addr_from_base58(deps: Deps, subdenom: &str) -> Result<String, anyho
         .map(|a| a.to_string())
         .context(format!("failed to humanize cosmos address {}", subdenom))
 }
+
+#[cfg(test)]
+mod test;
