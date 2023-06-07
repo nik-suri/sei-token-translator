@@ -18,7 +18,7 @@ use cw20_wrapped_2::msg::ExecuteMsg as Cw20WrappedExecuteMsg;
 
 use crate::{
     msg::{BridgingPayload, ExecuteMsg, InstantiateMsg, ReceiveAction},
-    state::{CURRENT_TRANSFER, CW_DENOMS, TOKEN_BRIDGE_CONTRACT, WORMHOLE_CONTRACT},
+    state::{CURRENT_TRANSFER, CW_DENOMS, TOKEN_BRIDGE_CONTRACT},
 };
 
 const COMPLETE_TRANSFER_REPLY_ID: u64 = 1;
@@ -33,10 +33,6 @@ pub fn instantiate(
     TOKEN_BRIDGE_CONTRACT
         .save(deps.storage, &msg.token_bridge_contract)
         .context("failed to save token bridge contract address to storage")?;
-
-    WORMHOLE_CONTRACT
-        .save(deps.storage, &msg.wormhole_contract)
-        .context("failed to save wormhole contract address to storage")?;
 
     Ok(Response::new()
         .add_attribute("action", "instantiate")
