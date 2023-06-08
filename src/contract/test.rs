@@ -5,21 +5,26 @@ use cosmwasm_std::{
     testing::{
         mock_dependencies, mock_env, mock_info, MockQuerier, MockStorage, MOCK_CONTRACT_ADDR,
     },
-    to_binary, Addr, Api, BankMsg, Binary, CanonicalAddr, Coin, ContractResult, CosmosMsg, Empty,
-    Env, OwnedDeps, RecoverPubkeyError, ReplyOn, StdError, StdResult, SystemError, SystemResult,
-    VerificationError, WasmMsg, WasmQuery,
+    to_binary, to_vec, Addr, Api, BankMsg, Binary, CanonicalAddr, Coin, ContractResult, CosmosMsg,
+    Empty, Env, OwnedDeps, RecoverPubkeyError, Reply, ReplyOn, StdError, StdResult, SubMsgResponse,
+    SystemError, SystemResult, VerificationError, WasmMsg, WasmQuery,
 };
-use cw_token_bridge::msg::TransferInfoResponse;
+use cw_token_bridge::msg::{AssetInfo, CompleteTransferResponse, TransferInfoResponse};
+use prost::Message;
 use sei_cosmwasm::SeiMsg;
 
 use crate::{
-    contract::{complete_transfer_and_convert, COMPLETE_TRANSFER_REPLY_ID},
-    state::{CW_DENOMS, TOKEN_BRIDGE_CONTRACT, CURRENT_TRANSFER, WORMHOLE_CONTRACT}, msg::InstantiateMsg,
+    contract::{
+        complete_transfer_and_convert, handle_complete_transfer_reply, COMPLETE_TRANSFER_REPLY_ID,
+    },
+    msg::InstantiateMsg,
+    state::{CURRENT_TRANSFER, CW_DENOMS, TOKEN_BRIDGE_CONTRACT, WORMHOLE_CONTRACT},
 };
 
 use super::{
     contract_addr_from_base58, contract_addr_to_base58, convert_and_transfer, convert_bank_to_cw20,
-    convert_cw20_to_bank, handle_receiver_msg, parse_bank_token_factory_contract, instantiate,
+    convert_cw20_to_bank, handle_receiver_msg, instantiate, parse_bank_token_factory_contract,
+    reply,
 };
 
 pub const SEI_CONTRACT_ADDR: &str =
@@ -190,6 +195,12 @@ fn mock_env_custom_contract(contract_addr: impl Into<String>) -> Env {
     return env;
 }
 
+#[derive(Clone, PartialEq, Message)]
+struct MsgExecuteContractResponse {
+    #[prost(bytes, tag = "1")]
+    pub data: ::prost::alloc::vec::Vec<u8>,
+}
+
 // methods to test:
 //
 // instantiate
@@ -251,7 +262,7 @@ fn complete_transfer_and_convert_happy_path() {
     let mut deps = default_custom_mock_deps();
     let env = mock_env_custom_contract(SEI_CONTRACT_ADDR);
 
-    let transfer_info_response = cw_token_bridge::msg::TransferInfoResponse {
+    let transfer_info_response = TransferInfoResponse {
         amount: 1000000u32.into(),
         token_address: hex::decode("0000000000000000000000009c3c9283d3e44854697cd22d3faa240cfb032889").unwrap().try_into().unwrap(),
         token_chain: 5,
@@ -266,7 +277,9 @@ fn complete_transfer_and_convert_happy_path() {
         WasmQuery::Smart {
             contract_addr: _,
             msg: _,
-        } => SystemResult::Ok(ContractResult::Ok(to_binary(&transfer_info_response_copy).unwrap())),
+        } => SystemResult::Ok(ContractResult::Ok(
+            to_binary(&transfer_info_response_copy).unwrap(),
+        )),
         _ => SystemResult::Err(SystemError::UnsupportedRequest {
             kind: "wasm".to_string(),
         }),
@@ -300,9 +313,15 @@ fn complete_transfer_and_convert_happy_path() {
     // response should have 2 attributes
     assert_eq!(response.attributes.len(), 2);
     assert_eq!(response.attributes[0].key, "action");
-    assert_eq!(response.attributes[0].value, "complete_transfer_with_payload");
+    assert_eq!(
+        response.attributes[0].value,
+        "complete_transfer_with_payload"
+    );
     assert_eq!(response.attributes[1].key, "transfer_payload");
-    assert_eq!(response.attributes[1].value, Binary::from(transfer_info_response.clone().payload).to_base64());
+    assert_eq!(
+        response.attributes[1].value,
+        Binary::from(transfer_info_response.clone().payload).to_base64()
+    );
 
     // finally, validate that the state was saved into storage
     let saved_transfer = CURRENT_TRANSFER.load(deps.as_mut().storage).unwrap();
@@ -848,30 +867,282 @@ fn convert_cw20_to_bank_failure_invalid_contract() {
     );
 }
 
-// match &response.messages[2].msg {
-//     CosmosMsg::Wasm(msg) => {
-//         match msg {
-//             WasmMsg::Execute { contract_addr, msg, funds } => println!("this is initiate transfer: {}", msg),
-//             _ => println!("no inner match")
-//         }
-//     },
-//     _ => println!("no match")
-// }
-
 // TESTS: reply
 // 1. Happy path: REPLY ID matches
+#[test]
+fn reply_happy_path() {
+    let mut deps = mock_dependencies();
+    let env = mock_env();
+
+    // for this test we don't build a proper reply.
+    // we're just testing that the handle_complete_transfer_reply method is called when the reply_id is 1
+    let msg = Reply {
+        id: 1,
+        result: cosmwasm_std::SubMsgResult::Err("random error".to_string()),
+    };
+
+    let err = reply(deps.as_mut(), env, msg).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "msg result is not okay, we should never get here"
+    );
+}
+
 // 2. ID does not match reply -- no op
+#[test]
+fn reply_no_id_match() {
+    let mut deps = mock_dependencies();
+    let env = mock_env();
+    let msg = Reply {
+        id: 0,
+        result: cosmwasm_std::SubMsgResult::Ok(SubMsgResponse {
+            events: vec![],
+            data: None,
+        }),
+    };
+
+    let err = reply(deps.as_mut(), env, msg).unwrap_err();
+    assert_eq!(err.to_string(), "unmatched reply id 0");
+}
 
 // TESTS: handle_complete_transfer_reply
 // 1. Happy path: calls convert_cw20_to_bank
+#[test]
+fn handle_complete_transfer_reply_happy_path() {
+    let mut deps = mock_dependencies();
+    let env = mock_env();
+    let msg = Reply {
+        id: 1,
+        result: cosmwasm_std::SubMsgResult::Ok(SubMsgResponse {
+            events: vec![],
+            data: Some(Binary::from_base64("CvgBeyJjb250cmFjdCI6InNlaTE0MG02eGFnbXcwemVzZWp6aHN2azQ2enByZ3Njcjd0dTk0aDM2cndzdXRjc3hjczRmbWRzOXNldnltIiwiZGVub20iOm51bGwsInJlY2lwaWVudCI6InNlaTFka2R3ZHZrbngwcWF2NWNwNWt3Njhta24zcjk5bTNzdmt5amZ2a3p0d2g5N2R2MmxtMGtzajZ4cmFrIiwiYW1vdW50IjoiMTAwMCIsInJlbGF5ZXIiOiJzZWkxdmhrbTJxdjc4NHJ1bHg4eWxydTB6cHZ5dnczbTNjeTl4M3h5ZnYiLCJmZWUiOiIwIn0=").unwrap())
+        })
+    };
+
+    let bad_transfer_payload = TransferInfoResponse {
+        amount: 0u32.into(),
+        token_address: [0; 32],
+        token_chain: 0,
+        recipient: [0; 32],
+        recipient_chain: 0,
+        fee: 0u32.into(),
+        payload: hex::decode("7b2262617369635f726563697069656e74223a7b22726563697069656e74223a22633256704d575636637a56745a4731334f486436646d4e7a4f585a344f586b335a4774306357646c4d336c36626a52334d477735626a5130227d7d").unwrap()
+    };
+    CURRENT_TRANSFER
+        .save(deps.as_mut().storage, &bad_transfer_payload)
+        .unwrap();
+
+    // just verifying that we called the convert_cw20_to_bank -- unwrap the result without an error
+    // other tests verify the correctness of this method
+    // wormhole core and token bridge tests verify the correctness of the VAA parameters
+    handle_complete_transfer_reply(deps.as_mut(), env, msg).unwrap();
+}
+
 // 2. Failure: msg result is not okay
+#[test]
+fn handle_complete_transfer_reply_bad_msg_result() {
+    let mut deps = mock_dependencies();
+    let env = mock_env();
+    let msg = Reply {
+        id: 1,
+        result: cosmwasm_std::SubMsgResult::Err("random error".to_string()),
+    };
+
+    let err = handle_complete_transfer_reply(deps.as_mut(), env, msg).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "msg result is not okay, we should never get here"
+    );
+}
+
 // 3. Failure: could not parse reply response_data
+#[test]
+fn handle_complete_transfer_reply_invalid_response_data() {
+    let mut deps = mock_dependencies();
+    let env = mock_env();
+    let msg = Reply {
+        id: 1,
+        result: cosmwasm_std::SubMsgResult::Ok(SubMsgResponse {
+            events: vec![],
+            data: Some(Binary::from_base64("eyJiYXNpY19yZWNpcGllbnQiOnsicmVjaXBpZW50IjoiYzJWcE1XVjZjelZ0WkcxM09IZDZkbU56T1haNE9YazNaR3QwY1dkbE0zbDZialIzTUd3NWJqUTAifX0=").unwrap())
+        })
+    };
+
+    let err = handle_complete_transfer_reply(deps.as_mut(), env, msg).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "failed to parse protobuf reply response_data"
+    );
+}
+
 // 4. Failure: no data in the parsed response
+#[test]
+fn handle_complete_transfer_reply_no_response_data() {
+    let mut deps = mock_dependencies();
+    let env = mock_env();
+    let msg = Reply {
+        id: 1,
+        result: cosmwasm_std::SubMsgResult::Ok(SubMsgResponse {
+            events: vec![],
+            data: Some(Binary::from_base64("").unwrap()),
+        }),
+    };
+
+    let err = handle_complete_transfer_reply(deps.as_mut(), env, msg).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "no data in the response, we should never get here"
+    );
+}
+
 // 5. Failure: could not deserialize response data
+#[test]
+fn handle_complete_transfer_reply_invalid_response_data_type() {
+    let mut deps = mock_dependencies();
+    let env = mock_env();
+
+    // encode a payload as protobuf
+    // the payload is NOT a CompleteTransferResponse
+    let execute_reply = MsgExecuteContractResponse {
+        data: to_vec(&AssetInfo::NativeToken {
+            denom: "denomA".to_string(),
+        })
+        .unwrap(),
+    };
+    let mut encoded_execute_reply = Vec::<u8>::with_capacity(execute_reply.encoded_len());
+    execute_reply.encode(&mut encoded_execute_reply).unwrap();
+
+    let msg = Reply {
+        id: 1,
+        result: cosmwasm_std::SubMsgResult::Ok(SubMsgResponse {
+            events: vec![],
+            data: Some(encoded_execute_reply.into()),
+        }),
+    };
+
+    let err = handle_complete_transfer_reply(deps.as_mut(), env, msg).unwrap_err();
+    assert_eq!(err.to_string(), "failed to deserialize response data");
+}
+
 // 6. Failure: no contract in the response
+#[test]
+fn handle_complete_transfer_reply_no_response_contract() {
+    let mut deps = mock_dependencies();
+    let env = mock_env();
+
+    // encode a payload as protobuf
+    // the payload is a CompleteTransferResponse
+    let execute_reply = MsgExecuteContractResponse {
+        data: to_vec(&CompleteTransferResponse {
+            contract: None,
+            denom: None,
+            recipient: "fake".to_string(),
+            amount: 1u32.into(),
+            relayer: "fake".to_string(),
+            fee: 0u32.into(),
+        })
+        .unwrap(),
+    };
+    let mut encoded_execute_reply = Vec::<u8>::with_capacity(execute_reply.encoded_len());
+    execute_reply.encode(&mut encoded_execute_reply).unwrap();
+
+    let msg = Reply {
+        id: 1,
+        result: cosmwasm_std::SubMsgResult::Ok(SubMsgResponse {
+            events: vec![],
+            data: Some(encoded_execute_reply.into()),
+        }),
+    };
+
+    let err = handle_complete_transfer_reply(deps.as_mut(), env, msg).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "no contract in response, we should never get here"
+    );
+}
+
 // 7. Failure: no current transfer in storage
+#[test]
+fn handle_complete_transfer_reply_no_storage() {
+    let mut deps = mock_dependencies();
+    let env = mock_env();
+    let msg = Reply {
+        id: 1,
+        result: cosmwasm_std::SubMsgResult::Ok(SubMsgResponse {
+            events: vec![],
+            data: Some(Binary::from_base64("CvgBeyJjb250cmFjdCI6InNlaTE0MG02eGFnbXcwemVzZWp6aHN2azQ2enByZ3Njcjd0dTk0aDM2cndzdXRjc3hjczRmbWRzOXNldnltIiwiZGVub20iOm51bGwsInJlY2lwaWVudCI6InNlaTFka2R3ZHZrbngwcWF2NWNwNWt3Njhta24zcjk5bTNzdmt5amZ2a3p0d2g5N2R2MmxtMGtzajZ4cmFrIiwiYW1vdW50IjoiMTAwMCIsInJlbGF5ZXIiOiJzZWkxdmhrbTJxdjc4NHJ1bHg4eWxydTB6cHZ5dnczbTNjeTl4M3h5ZnYiLCJmZWUiOiIwIn0=").unwrap())
+        })
+    };
+
+    let err = handle_complete_transfer_reply(deps.as_mut(), env, msg).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "failed to load current transfer from storage"
+    );
+}
+
 // 8. Failure: could not deserialize payload3 payload from stored transfer
+#[test]
+fn handle_complete_transfer_reply_wrong_stored_payload() {
+    let mut deps = mock_dependencies();
+    let env = mock_env();
+    let msg = Reply {
+        id: 1,
+        result: cosmwasm_std::SubMsgResult::Ok(SubMsgResponse {
+            events: vec![],
+            data: Some(Binary::from_base64("CvgBeyJjb250cmFjdCI6InNlaTE0MG02eGFnbXcwemVzZWp6aHN2azQ2enByZ3Njcjd0dTk0aDM2cndzdXRjc3hjczRmbWRzOXNldnltIiwiZGVub20iOm51bGwsInJlY2lwaWVudCI6InNlaTFka2R3ZHZrbngwcWF2NWNwNWt3Njhta24zcjk5bTNzdmt5amZ2a3p0d2g5N2R2MmxtMGtzajZ4cmFrIiwiYW1vdW50IjoiMTAwMCIsInJlbGF5ZXIiOiJzZWkxdmhrbTJxdjc4NHJ1bHg4eWxydTB6cHZ5dnczbTNjeTl4M3h5ZnYiLCJmZWUiOiIwIn0=").unwrap())
+        })
+    };
+
+    let bad_transfer_payload = TransferInfoResponse {
+        amount: 0u32.into(),
+        token_address: [0; 32],
+        token_chain: 0,
+        recipient: [0; 32],
+        recipient_chain: 0,
+        fee: 0u32.into(),
+        payload: hex::decode("7b22726563697069656e74223a7b22726563697069656e74223a22633256704d575636637a56745a4731334f486436646d4e7a4f585a344f586b335a4774306357646c4d336c36626a52334d477735626a5130227d7d").unwrap()
+    };
+    CURRENT_TRANSFER
+        .save(deps.as_mut().storage, &bad_transfer_payload)
+        .unwrap();
+
+    let err = handle_complete_transfer_reply(deps.as_mut(), env, msg).unwrap_err();
+    assert_eq!(err.to_string(), "failed to deserialize transfer payload");
+}
+
 // 9. Failure: could not convert the recipient base64 encoded bytes to a utf8 string
+#[test]
+fn handle_complete_transfer_reply_invalid_recipient() {
+    let mut deps = mock_dependencies();
+    let env = mock_env();
+    let msg = Reply {
+        id: 1,
+        result: cosmwasm_std::SubMsgResult::Ok(SubMsgResponse {
+            events: vec![],
+            data: Some(Binary::from_base64("CvgBeyJjb250cmFjdCI6InNlaTE0MG02eGFnbXcwemVzZWp6aHN2azQ2enByZ3Njcjd0dTk0aDM2cndzdXRjc3hjczRmbWRzOXNldnltIiwiZGVub20iOm51bGwsInJlY2lwaWVudCI6InNlaTFka2R3ZHZrbngwcWF2NWNwNWt3Njhta24zcjk5bTNzdmt5amZ2a3p0d2g5N2R2MmxtMGtzajZ4cmFrIiwiYW1vdW50IjoiMTAwMCIsInJlbGF5ZXIiOiJzZWkxdmhrbTJxdjc4NHJ1bHg4eWxydTB6cHZ5dnczbTNjeTl4M3h5ZnYiLCJmZWUiOiIwIn0=").unwrap())
+        })
+    };
+
+    let bad_transfer_payload = TransferInfoResponse {
+        amount: 0u32.into(),
+        token_address: [0; 32],
+        token_chain: 0,
+        recipient: [0; 32],
+        recipient_chain: 0,
+        fee: 0u32.into(),
+        payload: hex::decode("7b2262617369635f726563697069656e74223a7b22726563697069656e74223a223256704d575636637a56745a4731334f486436646d4e7a4f585a344f586b335a4774306357646c4d336c36626a52334d477735626a5130227d7d").unwrap()
+    };
+    CURRENT_TRANSFER
+        .save(deps.as_mut().storage, &bad_transfer_payload)
+        .unwrap();
+
+    let err = handle_complete_transfer_reply(deps.as_mut(), env, msg).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "failed to convert 2VpMWV6czVtZG13OHd6dmNzOXZ4OXk3ZGt0cWdlM3l6bjR3MGw5bjQ0= to utf8 string"
+    );
+}
 
 // TESTS: parse_bank_token_factory_contract
 // 1. Happy path

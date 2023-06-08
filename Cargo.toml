@@ -54,3 +54,4 @@ wormhole-cosmwasm = { git = "https://github.com/wormhole-foundation/wormhole" }
 [dev-dependencies]
 cosmwasm-crypto = { version = "1.2.5" }
 hex = "0.4.3"
+prost = "0.11.0"
