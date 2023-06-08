@@ -442,6 +442,7 @@ dependencies = [
  "cw-utils 1.0.1",
  "cw20",
  "cw20-wrapped-2",
+ "hex",
  "sei-cosmwasm",
  "serde-json-wasm 0.4.1",
  "token-bridge-cosmwasm",

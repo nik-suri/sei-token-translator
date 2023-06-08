@@ -5,16 +5,21 @@ use cosmwasm_std::{
     testing::{
         mock_dependencies, mock_env, mock_info, MockQuerier, MockStorage, MOCK_CONTRACT_ADDR,
     },
-    Addr, Api, BankMsg, Binary, CanonicalAddr, Coin, CosmosMsg, Empty, OwnedDeps,
-    RecoverPubkeyError, StdError, StdResult, VerificationError, WasmMsg,
+    to_binary, Addr, Api, BankMsg, Binary, CanonicalAddr, Coin, ContractResult, CosmosMsg, Empty,
+    Env, OwnedDeps, RecoverPubkeyError, ReplyOn, StdError, StdResult, SystemError, SystemResult,
+    VerificationError, WasmMsg, WasmQuery,
 };
+use cw_token_bridge::msg::TransferInfoResponse;
 use sei_cosmwasm::SeiMsg;
 
-use crate::state::CW_DENOMS;
+use crate::{
+    contract::{complete_transfer_and_convert, COMPLETE_TRANSFER_REPLY_ID},
+    state::{CW_DENOMS, TOKEN_BRIDGE_CONTRACT, CURRENT_TRANSFER, WORMHOLE_CONTRACT}, msg::InstantiateMsg,
+};
 
 use super::{
-    contract_addr_from_base58, contract_addr_to_base58, convert_bank_to_cw20, convert_cw20_to_bank,
-    handle_receiver_msg, parse_bank_token_factory_contract,
+    contract_addr_from_base58, contract_addr_to_base58, convert_and_transfer, convert_bank_to_cw20,
+    convert_cw20_to_bank, handle_receiver_msg, parse_bank_token_factory_contract, instantiate,
 };
 
 pub const SEI_CONTRACT_ADDR: &str =
@@ -179,6 +184,12 @@ fn custom_mock_deps(
     }
 }
 
+fn mock_env_custom_contract(contract_addr: impl Into<String>) -> Env {
+    let mut env = mock_env();
+    env.contract.address = Addr::unchecked(contract_addr);
+    return env;
+}
+
 // methods to test:
 //
 // instantiate
@@ -203,31 +214,396 @@ fn custom_mock_deps(
 
 // TESTS: instantiate
 // 1. Happy path, ensure everything is set
+#[test]
+fn instantiate_happy_path() {
+    let tokenbridge_addr = "faketokenbridge".to_string();
+    let corebridge_addr = "fakewormhole".to_string();
 
-// TESTS: migrate
-// 1. Happy path, nothing should happen
+    let mut deps = mock_dependencies();
+    let env = mock_env();
+    let info = mock_info(SEI_USER_ADDR, &vec![]);
+    let msg = InstantiateMsg {
+        token_bridge_contract: tokenbridge_addr.clone(),
+        wormhole_contract: corebridge_addr.clone(),
+    };
 
-// TESTS: execute
-// 1. Ensure each message calls the correct method
+    let response = instantiate(deps.as_mut(), env, info, msg).unwrap();
+
+    // response should have 2 attributes
+    assert_eq!(response.attributes.len(), 2);
+    assert_eq!(response.attributes[0].key, "action");
+    assert_eq!(response.attributes[0].value, "instantiate");
+    assert_eq!(response.attributes[1].key, "owner");
+    assert_eq!(response.attributes[1].value, SEI_USER_ADDR);
+
+    // contract addrs should have been set in storage
+    let saved_tb = TOKEN_BRIDGE_CONTRACT.load(deps.as_mut().storage).unwrap();
+    assert_eq!(saved_tb, tokenbridge_addr);
+
+    let saved_wh = WORMHOLE_CONTRACT.load(deps.as_mut().storage).unwrap();
+    assert_eq!(saved_wh, corebridge_addr);
+}
 
 // TESTS: complete_transfer_and_convert
 // 1. Happy path
+#[test]
+fn complete_transfer_and_convert_happy_path() {
+    let mut deps = default_custom_mock_deps();
+    let env = mock_env_custom_contract(SEI_CONTRACT_ADDR);
+
+    let transfer_info_response = cw_token_bridge::msg::TransferInfoResponse {
+        amount: 1000000u32.into(),
+        token_address: hex::decode("0000000000000000000000009c3c9283d3e44854697cd22d3faa240cfb032889").unwrap().try_into().unwrap(),
+        token_chain: 5,
+        recipient: hex::decode("23aae62840414d69ebc26023d1132f59eef316c82222da4644daaa832ea56349").unwrap().try_into().unwrap(),
+        recipient_chain: 32,
+        fee: 0u32.into(),
+        payload: hex::decode("7b2262617369635f726563697069656e74223a7b22726563697069656e74223a22633256704d575636637a56745a4731334f486436646d4e7a4f585a344f586b335a4774306357646c4d336c36626a52334d477735626a5130227d7d").unwrap(),
+    };
+    let transfer_info_response_copy = transfer_info_response.clone();
+
+    deps.querier.update_wasm(move |q| match q {
+        WasmQuery::Smart {
+            contract_addr: _,
+            msg: _,
+        } => SystemResult::Ok(ContractResult::Ok(to_binary(&transfer_info_response_copy).unwrap())),
+        _ => SystemResult::Err(SystemError::UnsupportedRequest {
+            kind: "wasm".to_string(),
+        }),
+    });
+
+    let token_bridge_addr = "faketokenbridge".to_string();
+    TOKEN_BRIDGE_CONTRACT
+        .save(deps.as_mut().storage, &token_bridge_addr)
+        .unwrap();
+
+    let info = mock_info(SEI_USER_ADDR, &vec![]);
+    let vaa = Binary::from_base64("AAAAAA").unwrap();
+
+    let response = complete_transfer_and_convert(deps.as_mut(), env, info, vaa).unwrap();
+
+    // response should have 1 message
+    assert_eq!(response.messages.len(), 1);
+
+    // 1. WasmMsg::Execute (token bridge complete transfer)
+    assert_eq!(response.messages[0].id, COMPLETE_TRANSFER_REPLY_ID);
+    assert_eq!(response.messages[0].reply_on, ReplyOn::Success);
+    assert_eq!(
+        response.messages[0].msg,
+        CosmosMsg::Wasm(WasmMsg::Execute {
+            contract_addr: token_bridge_addr,
+            msg: Binary::from_base64("eyJjb21wbGV0ZV90cmFuc2Zlcl93aXRoX3BheWxvYWQiOnsiZGF0YSI6IkFBQUFBQT09IiwicmVsYXllciI6InNlaTF2aGttMnF2Nzg0cnVseDh5bHJ1MHpwdnl2dzNtM2N5OXgzeHlmdiJ9fQ==").unwrap(),
+            funds: vec![]
+        })
+    );
+
+    // response should have 2 attributes
+    assert_eq!(response.attributes.len(), 2);
+    assert_eq!(response.attributes[0].key, "action");
+    assert_eq!(response.attributes[0].value, "complete_transfer_with_payload");
+    assert_eq!(response.attributes[1].key, "transfer_payload");
+    assert_eq!(response.attributes[1].value, Binary::from(transfer_info_response.clone().payload).to_base64());
+
+    // finally, validate that the state was saved into storage
+    let saved_transfer = CURRENT_TRANSFER.load(deps.as_mut().storage).unwrap();
+    assert_eq!(saved_transfer, transfer_info_response);
+}
+
 // 2. Failure: no token bridge address in state
-// 3. Failure: couldn't serialize token bridge execute msg
-// 4. Failure: couldn't serialize token bridge query msg
-// 5. Failure: token bridge query TransferInfo failed
-// 6. Failure: could not humanize recipient address
-// 7. Failure: recipient address doesn't match contract address
-// 8. Failure: couldn't save current transfer to storage
+#[test]
+fn complete_transfer_and_convert_no_token_bridge_state() {
+    let mut deps = default_custom_mock_deps();
+    let info = mock_info(SEI_USER_ADDR, &vec![]);
+    let env = mock_env();
+    let vaa = Binary::from_base64("fakevaa").unwrap();
+
+    let err = complete_transfer_and_convert(deps.as_mut(), env, info, vaa).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "could not load token bridge contract address"
+    );
+}
+
+// 3. Failure: token bridge query TransferInfo failed
+#[test]
+fn complete_transfer_and_convert_failure_transferinfo_query() {
+    let mut deps = default_custom_mock_deps();
+    deps.querier.update_wasm(|q| match q {
+        WasmQuery::Smart {
+            contract_addr: _,
+            msg: _,
+        } => SystemResult::Ok(ContractResult::Err("query failed".to_string())),
+        _ => SystemResult::Err(SystemError::UnsupportedRequest {
+            kind: "wasm".to_string(),
+        }),
+    });
+
+    let token_bridge_addr = "faketokenbridge".to_string();
+    TOKEN_BRIDGE_CONTRACT
+        .save(deps.as_mut().storage, &token_bridge_addr)
+        .unwrap();
+
+    let info = mock_info(SEI_USER_ADDR, &vec![]);
+    let env = mock_env();
+    let vaa = Binary::from_base64("fakevaa").unwrap();
+
+    let err = complete_transfer_and_convert(deps.as_mut(), env, info, vaa).unwrap_err();
+    assert_eq!(err.to_string(), "could not parse token bridge payload3 vaa");
+}
+
+// 4. Failure: could not humanize recipient address
+#[test]
+fn complete_transfer_and_convert_failure_humanize_recipient() {
+    let mut deps = default_custom_mock_deps();
+    let env = mock_env();
+
+    let transfer_info_response = to_binary(&cw_token_bridge::msg::TransferInfoResponse {
+        amount: 1000000u32.into(),
+        token_address: hex::decode("0000000000000000000000009c3c9283d3e44854697cd22d3faa240cfb032889").unwrap().try_into().unwrap(),
+        token_chain: 5,
+        recipient: hex::decode("6d9ae6b2d333c1d65301a59da3eed388ca5dc60cb12496584b75cbe6b15fdbed").unwrap().try_into().unwrap(),
+        recipient_chain: 32,
+        fee: 0u32.into(),
+        payload: hex::decode("7b2262617369635f726563697069656e74223a7b22726563697069656e74223a22633256704d575636637a56745a4731334f486436646d4e7a4f585a344f586b335a4774306357646c4d336c36626a52334d477735626a5130227d7d").unwrap(),
+    }).unwrap();
+
+    deps.querier.update_wasm(move |q| match q {
+        WasmQuery::Smart {
+            contract_addr: _,
+            msg: _,
+        } => SystemResult::Ok(ContractResult::Ok(transfer_info_response.clone())),
+        _ => SystemResult::Err(SystemError::UnsupportedRequest {
+            kind: "wasm".to_string(),
+        }),
+    });
+
+    let token_bridge_addr = "faketokenbridge".to_string();
+    TOKEN_BRIDGE_CONTRACT
+        .save(deps.as_mut().storage, &token_bridge_addr)
+        .unwrap();
+
+    let info = mock_info(SEI_USER_ADDR, &vec![]);
+    let vaa = Binary::from_base64("AAAAAA").unwrap();
+
+    let err = complete_transfer_and_convert(deps.as_mut(), env, info, vaa).unwrap_err();
+    assert_eq!(err.to_string(), "Generic error: case not found");
+}
+
+// 5. Failure: recipient address doesn't match contract address
+#[test]
+fn complete_transfer_and_convert_nomatch_recipient_contract() {
+    let mut deps = default_custom_mock_deps();
+    let env = mock_env();
+
+    let transfer_info_response = to_binary(&cw_token_bridge::msg::TransferInfoResponse {
+        amount: 1000000u32.into(),
+        token_address: hex::decode("0000000000000000000000009c3c9283d3e44854697cd22d3faa240cfb032889").unwrap().try_into().unwrap(),
+        token_chain: 5,
+        recipient: hex::decode("23aae62840414d69ebc26023d1132f59eef316c82222da4644daaa832ea56349").unwrap().try_into().unwrap(),
+        recipient_chain: 32,
+        fee: 0u32.into(),
+        payload: hex::decode("7b2262617369635f726563697069656e74223a7b22726563697069656e74223a22633256704d575636637a56745a4731334f486436646d4e7a4f585a344f586b335a4774306357646c4d336c36626a52334d477735626a5130227d7d").unwrap(),
+    }).unwrap();
+
+    deps.querier.update_wasm(move |q| match q {
+        WasmQuery::Smart {
+            contract_addr: _,
+            msg: _,
+        } => SystemResult::Ok(ContractResult::Ok(transfer_info_response.clone())),
+        _ => SystemResult::Err(SystemError::UnsupportedRequest {
+            kind: "wasm".to_string(),
+        }),
+    });
+
+    let token_bridge_addr = "faketokenbridge".to_string();
+    TOKEN_BRIDGE_CONTRACT
+        .save(deps.as_mut().storage, &token_bridge_addr)
+        .unwrap();
+
+    let info = mock_info(SEI_USER_ADDR, &vec![]);
+    let vaa = Binary::from_base64("AAAAAA").unwrap();
+
+    let err = complete_transfer_and_convert(deps.as_mut(), env, info, vaa).unwrap_err();
+    assert_eq!(err.to_string(), "vaa recipient must be this contract");
+}
 
 // TESTS: convert_and_transfer
 // 1. Happy path
+#[test]
+fn convert_and_transfer_happy_path() {
+    let mut deps = default_custom_mock_deps();
+
+    let token_bridge_addr = "faketokenbridge".to_string();
+    TOKEN_BRIDGE_CONTRACT
+        .save(deps.as_mut().storage, &token_bridge_addr)
+        .unwrap();
+    let tokenfactory_denom =
+        "factory/cosmos2contract/3QEQyi7iyJHwQ4wfUMLFPB4kRzczMAXCitWh7h6TETDa".to_string();
+    CW_DENOMS
+        .save(
+            deps.as_mut().storage,
+            SEI_CONTRACT_ADDR.to_string(),
+            &tokenfactory_denom,
+        )
+        .unwrap();
+    let coin = coin(1, tokenfactory_denom);
+
+    let info = mock_info(SEI_USER_ADDR, &vec![coin.clone()]);
+    let env = mock_env();
+    let recipient_chain = 2;
+    let recipient = Binary::from_base64("AAAAAAAAAAAAAAAAjyagAl3Mxs/Aen04dWKAoQ4pWtc=").unwrap();
+    let fee = 0u32;
+
+    let response = convert_and_transfer(
+        deps.as_mut(),
+        info,
+        env,
+        recipient_chain,
+        recipient,
+        fee.into(),
+    )
+    .unwrap();
+
+    // response should have 3 messages
+    assert_eq!(response.messages.len(), 3);
+
+    // 1. SeiMsg::BurnTokens
+    assert_eq!(
+        response.messages[0].msg,
+        CosmosMsg::Custom(SeiMsg::BurnTokens {
+            amount: coin.clone()
+        })
+    );
+
+    // 2. WasmMsg::Execute (increase allowance)
+    assert_eq!(
+        response.messages[1].msg,
+        CosmosMsg::Wasm(WasmMsg::Execute {
+            contract_addr: SEI_CONTRACT_ADDR.to_string(),
+            msg: Binary::from_base64("eyJpbmNyZWFzZV9hbGxvd2FuY2UiOnsic3BlbmRlciI6ImZha2V0b2tlbmJyaWRnZSIsImFtb3VudCI6IjEiLCJleHBpcmVzIjpudWxsfX0=").unwrap(),
+            funds: vec![]
+        })
+    );
+
+    // 3. WasmMsg::Execute (initiate transfer)
+    assert_eq!(
+        response.messages[2].msg,
+        CosmosMsg::Wasm(WasmMsg::Execute {
+            contract_addr: token_bridge_addr,
+            msg: Binary::from_base64("eyJpbml0aWF0ZV90cmFuc2ZlciI6eyJhc3NldCI6eyJpbmZvIjp7InRva2VuIjp7ImNvbnRyYWN0X2FkZHIiOiJzZWkxeXc0d3YyenFnOXhrbjY3enZxM2F6eWUwdDhoMHg5a2d5ZzNkNTNqeW0yNGd4dDQ5dmR5c3drNXVwaiJ9fSwiYW1vdW50IjoiMSJ9LCJyZWNpcGllbnRfY2hhaW4iOjIsInJlY2lwaWVudCI6IkFBQUFBQUFBQUFBQUFBQUFqeWFnQWwzTXhzL0FlbjA0ZFdLQW9RNHBXdGM9IiwiZmVlIjoiMCIsIm5vbmNlIjowfX0=").unwrap(),
+            funds: vec![]
+        })
+    );
+}
+
 // 2. Failure: no token bridge address in state
+#[test]
+fn convert_and_transfer_no_token_bridge_state() {
+    let mut deps = default_custom_mock_deps();
+    let info = mock_info(SEI_USER_ADDR, &vec![]);
+    let env = mock_env();
+    let recipient_chain = 2;
+    let recipient = Binary::from_base64("AAAAAAAAAAAAAAAAjyagAl3Mxs/Aen04dWKAoQ4pWtc=").unwrap();
+    let fee = 0u32;
+
+    let err = convert_and_transfer(
+        deps.as_mut(),
+        info,
+        env,
+        recipient_chain,
+        recipient,
+        fee.into(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "could not load token bridge contract address"
+    );
+}
+
 // 3. Failure: no coin in funds
+#[test]
+fn convert_and_transfer_no_funds() {
+    let mut deps = default_custom_mock_deps();
+
+    let token_bridge_addr = "faketokenbridge".to_string();
+    TOKEN_BRIDGE_CONTRACT
+        .save(deps.as_mut().storage, &token_bridge_addr)
+        .unwrap();
+
+    let info = mock_info(SEI_USER_ADDR, &vec![]);
+    let env = mock_env();
+    let recipient_chain = 2;
+    let recipient = Binary::from_base64("AAAAAAAAAAAAAAAAjyagAl3Mxs/Aen04dWKAoQ4pWtc=").unwrap();
+    let fee = 0u32;
+
+    let err = convert_and_transfer(
+        deps.as_mut(),
+        info,
+        env,
+        recipient_chain,
+        recipient,
+        fee.into(),
+    )
+    .unwrap_err();
+    assert_eq!(err.to_string(), "info.funds should contain only 1 coin");
+}
+
 // 4. Failure: more coins than expected in funds
+#[test]
+fn convert_and_transfer_too_many_funds() {
+    let mut deps = default_custom_mock_deps();
+
+    let token_bridge_addr = "faketokenbridge".to_string();
+    TOKEN_BRIDGE_CONTRACT
+        .save(deps.as_mut().storage, &token_bridge_addr)
+        .unwrap();
+
+    let info = mock_info(SEI_USER_ADDR, &vec![coin(1, "denomA"), coin(1, "denomB")]);
+    let env = mock_env();
+    let recipient_chain = 2;
+    let recipient = Binary::from_base64("AAAAAAAAAAAAAAAAjyagAl3Mxs/Aen04dWKAoQ4pWtc=").unwrap();
+    let fee = 0u32;
+
+    let err = convert_and_transfer(
+        deps.as_mut(),
+        info,
+        env,
+        recipient_chain,
+        recipient,
+        fee.into(),
+    )
+    .unwrap_err();
+    assert_eq!(err.to_string(), "info.funds should contain only 1 coin");
+}
+
 // 5. Failure: parse_bank_token_factory_contract method failure
-// 6. Failure: couldn't serialize IncreaseAllowance msg
-// 7. Failure: couldn't serialize InitiateTransfer msg
+#[test]
+fn convert_and_transfer_parse_method_failure() {
+    let mut deps = default_custom_mock_deps();
+
+    let token_bridge_addr = "faketokenbridge".to_string();
+    TOKEN_BRIDGE_CONTRACT
+        .save(deps.as_mut().storage, &token_bridge_addr)
+        .unwrap();
+
+    let info = mock_info(SEI_USER_ADDR, &vec![coin(1, "denomA")]);
+    let env = mock_env();
+    let recipient_chain = 2;
+    let recipient = Binary::from_base64("AAAAAAAAAAAAAAAAjyagAl3Mxs/Aen04dWKAoQ4pWtc=").unwrap();
+    let fee = 0u32;
+
+    let err = convert_and_transfer(
+        deps.as_mut(),
+        info,
+        env,
+        recipient_chain,
+        recipient,
+        fee.into(),
+    )
+    .unwrap_err();
+    assert_eq!(err.to_string(), "coin is not from the token factory");
+}
 
 // TESTS: convert_bank_to_cw20
 // 1. Happy path
@@ -471,6 +847,16 @@ fn convert_cw20_to_bank_failure_invalid_contract() {
         "invalid contract address badContractAddr"
     );
 }
+
+// match &response.messages[2].msg {
+//     CosmosMsg::Wasm(msg) => {
+//         match msg {
+//             WasmMsg::Execute { contract_addr, msg, funds } => println!("this is initiate transfer: {}", msg),
+//             _ => println!("no inner match")
+//         }
+//     },
+//     _ => println!("no match")
+// }
 
 // TESTS: reply
 // 1. Happy path: REPLY ID matches
