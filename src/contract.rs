@@ -1,7 +1,7 @@
 #[cfg(not(feature = "library"))]
 use cosmwasm_std::entry_point;
 
-use anyhow::{ensure, Context};
+use anyhow::{bail, ensure, Context};
 use cosmwasm_std::{
     coin, from_binary, to_binary, BankMsg, Binary, Coin, CosmosMsg, Deps, DepsMut, Empty, Env,
     MessageInfo, QueryRequest, Reply, Response, SubMsg, Uint128, WasmMsg, WasmQuery,
@@ -81,9 +81,8 @@ pub fn reply(deps: DepsMut, env: Env, msg: Reply) -> Result<Response<SeiMsg>, an
         return handle_complete_transfer_reply(deps, env, msg);
     }
 
-    // other cases probably from calling into the sei burn/mint messages and token factory methods
-
-    Ok(Response::default())
+    // for safety, let's error out if we don't match a reply ID
+    bail!("unmatched reply id {}", msg.id);
 }
 
 fn handle_complete_transfer_reply(
