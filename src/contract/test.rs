@@ -334,7 +334,7 @@ fn complete_transfer_and_convert_no_token_bridge_state() {
     let mut deps = default_custom_mock_deps();
     let info = mock_info(SEI_USER_ADDR, &vec![]);
     let env = mock_env();
-    let vaa = Binary::from_base64("fakevaa").unwrap();
+    let vaa = Binary::from_base64("AAAAAA").unwrap();
 
     let err = complete_transfer_and_convert(deps.as_mut(), env, info, vaa).unwrap_err();
     assert_eq!(
@@ -364,7 +364,7 @@ fn complete_transfer_and_convert_failure_transferinfo_query() {
 
     let info = mock_info(SEI_USER_ADDR, &vec![]);
     let env = mock_env();
-    let vaa = Binary::from_base64("fakevaa").unwrap();
+    let vaa = Binary::from_base64("AAAAAA").unwrap();
 
     let err = complete_transfer_and_convert(deps.as_mut(), env, info, vaa).unwrap_err();
     assert_eq!(err.to_string(), "could not parse token bridge payload3 vaa");
