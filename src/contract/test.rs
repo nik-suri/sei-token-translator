@@ -1,14 +1,21 @@
 use std::marker::PhantomData;
 
 use cosmwasm_std::{
-    testing::{mock_dependencies, mock_env, MockQuerier, MockStorage, MOCK_CONTRACT_ADDR},
-    Addr, Api, Binary, CanonicalAddr, Empty, OwnedDeps, RecoverPubkeyError, StdError, StdResult,
-    VerificationError, Coin,
+    coin,
+    testing::{
+        mock_dependencies, mock_env, mock_info, MockQuerier, MockStorage, MOCK_CONTRACT_ADDR,
+    },
+    Addr, Api, BankMsg, Binary, CanonicalAddr, Coin, CosmosMsg, Empty, OwnedDeps,
+    RecoverPubkeyError, StdError, StdResult, VerificationError, WasmMsg,
 };
+use sei_cosmwasm::SeiMsg;
 
 use crate::state::CW_DENOMS;
 
-use super::{contract_addr_from_base58, contract_addr_to_base58, parse_bank_token_factory_contract};
+use super::{
+    contract_addr_from_base58, contract_addr_to_base58, convert_bank_to_cw20, convert_cw20_to_bank,
+    handle_receiver_msg, parse_bank_token_factory_contract,
+};
 
 pub const SEI_CONTRACT_ADDR: &str =
     "sei1yw4wv2zqg9xkn67zvq3azye0t8h0x9kgyg3d53jym24gxt49vdyswk5upj";
@@ -224,22 +231,246 @@ fn custom_mock_deps(
 
 // TESTS: convert_bank_to_cw20
 // 1. Happy path
+#[test]
+fn convert_bank_to_cw20_happy_path() {
+    let mut deps = default_custom_mock_deps();
+
+    let tokenfactory_denom =
+        "factory/cosmos2contract/3QEQyi7iyJHwQ4wfUMLFPB4kRzczMAXCitWh7h6TETDa".to_string();
+    CW_DENOMS
+        .save(
+            deps.as_mut().storage,
+            SEI_CONTRACT_ADDR.to_string(),
+            &tokenfactory_denom,
+        )
+        .unwrap();
+    let coin = coin(1, tokenfactory_denom);
+    let info = mock_info(SEI_USER_ADDR, &vec![coin.clone()]);
+    let env = mock_env();
+
+    let response = convert_bank_to_cw20(deps.as_mut(), info, env).unwrap();
+
+    // response should have 2 messages
+    assert_eq!(response.messages.len(), 2);
+
+    // 1. SeiMsg::BurnTokens
+    assert_eq!(
+        response.messages[0].msg,
+        CosmosMsg::Custom(SeiMsg::BurnTokens {
+            amount: coin.clone()
+        })
+    );
+
+    // 2. WasmMsg::Execute
+    assert_eq!(
+        response.messages[1].msg,
+        CosmosMsg::Wasm(WasmMsg::Execute {
+            contract_addr: SEI_CONTRACT_ADDR.to_string(),
+            msg: Binary::from_base64("eyJ0cmFuc2ZlciI6eyJyZWNpcGllbnQiOiJzZWkxdmhrbTJxdjc4NHJ1bHg4eWxydTB6cHZ5dnczbTNjeTl4M3h5ZnYiLCJhbW91bnQiOiIxIn19").unwrap(),
+            funds: vec![]
+        })
+    )
+}
+
 // 2. Failure: no coin in funds
+#[test]
+fn convert_bank_to_cw20_failure_no_funds() {
+    let mut deps = default_custom_mock_deps();
+    let info = mock_info(SEI_USER_ADDR, &vec![]);
+    let env = mock_env();
+
+    let err = convert_bank_to_cw20(deps.as_mut(), info, env).unwrap_err();
+    assert_eq!(err.to_string(), "info.funds should contain only 1 coin");
+}
+
 // 3. Failure: more coins than expected in funds
+#[test]
+fn convert_bank_to_cw20_failure_too_many_funds() {
+    let mut deps = default_custom_mock_deps();
+    let info = mock_info(SEI_USER_ADDR, &vec![coin(1, "denomA"), coin(1, "denomB")]);
+    let env = mock_env();
+
+    let err = convert_bank_to_cw20(deps.as_mut(), info, env).unwrap_err();
+    assert_eq!(err.to_string(), "info.funds should contain only 1 coin");
+}
+
 // 4. Failure: parse_bank_token_factory_contract method failure
-// 5. Failure: couldn't serialize cw20::Transfer msg
+#[test]
+fn convert_bank_to_cw20_failure_invalid_token() {
+    let mut deps = default_custom_mock_deps();
+    let info = mock_info(SEI_USER_ADDR, &vec![coin(1, "denomA")]);
+    let env = mock_env();
+
+    let err = convert_bank_to_cw20(deps.as_mut(), info, env).unwrap_err();
+    assert_eq!(err.to_string(), "coin is not from the token factory");
+}
 
 // TESTS: handle_receiver_msg
 // 1. Happy path
+#[test]
+fn handle_receiver_msg_happy_path() {
+    let mut deps = default_custom_mock_deps();
+    let info = mock_info(SEI_CONTRACT_ADDR, &vec![]);
+    let env = mock_env();
+    let sender = SEI_USER_ADDR.to_string();
+    let amount = 1u32;
+    let msg_payload = Binary::from_base64("eyJjb252ZXJ0X3RvX2JhbmsiOnt9fQ==").unwrap();
+
+    let response =
+        handle_receiver_msg(deps.as_mut(), info, env, sender, amount.into(), msg_payload).unwrap();
+    assert_eq!(response.messages.len(), 3);
+}
+
 // 2. Failure: couldn't parse receive action payload
+#[test]
+fn handle_receiver_msg_invalid_payload() {
+    let mut deps = default_custom_mock_deps();
+    let info = mock_info(SEI_CONTRACT_ADDR, &vec![]);
+    let env = mock_env();
+    let sender = SEI_USER_ADDR.to_string();
+    let amount = 1u32;
+    let msg_payload = Binary::from_base64("Jjb252ZXJ0X3RvX2JhbmsiOnt9fQ").unwrap();
+
+    let err = handle_receiver_msg(deps.as_mut(), info, env, sender, amount.into(), msg_payload)
+        .unwrap_err();
+    assert_eq!(err.to_string(), "could not parse receive action payload");
+}
 
 // TESTS: convert_cw20_to_bank
 // 1. Happy path
+#[test]
+fn convert_cw20_to_bank_happy_path() {
+    let mut deps = default_custom_mock_deps();
+    let env = mock_env();
+    let recipient = SEI_USER_ADDR.to_string();
+    let amount = 1;
+    let contract_addr = SEI_CONTRACT_ADDR.to_string();
+
+    let tokenfactory_denom =
+        "factory/cosmos2contract/3QEQyi7iyJHwQ4wfUMLFPB4kRzczMAXCitWh7h6TETDa".to_string();
+    CW_DENOMS
+        .save(
+            deps.as_mut().storage,
+            contract_addr.clone(),
+            &tokenfactory_denom,
+        )
+        .unwrap();
+
+    let response = convert_cw20_to_bank(
+        deps.as_mut(),
+        env,
+        recipient.clone(),
+        amount.clone(),
+        contract_addr,
+    )
+    .unwrap();
+
+    // response should have 2 messages:
+    assert_eq!(response.messages.len(), 2);
+
+    // 1. SeiMsg::MintTokens
+    let expected_coin = coin(amount, tokenfactory_denom);
+    assert_eq!(
+        response.messages[0].msg,
+        CosmosMsg::Custom(SeiMsg::MintTokens {
+            amount: expected_coin.clone()
+        })
+    );
+
+    // 2. BankMsg::Send
+    assert_eq!(
+        response.messages[1].msg,
+        CosmosMsg::Bank(BankMsg::Send {
+            to_address: recipient,
+            amount: vec![expected_coin]
+        })
+    );
+}
+
 // 2. Happy path + CreateDenom on TokenFactory
+#[test]
+fn convert_cw20_to_bank_happy_path_create_denom() {
+    let mut deps = default_custom_mock_deps();
+    let env = mock_env();
+    let recipient = SEI_USER_ADDR.to_string();
+    let amount = 1;
+    let contract_addr = SEI_CONTRACT_ADDR.to_string();
+
+    let tokenfactory_denom =
+        "factory/cosmos2contract/3QEQyi7iyJHwQ4wfUMLFPB4kRzczMAXCitWh7h6TETDa".to_string();
+
+    let response = convert_cw20_to_bank(
+        deps.as_mut(),
+        env,
+        recipient.clone(),
+        amount.clone(),
+        contract_addr,
+    )
+    .unwrap();
+
+    // response should have 3 messages:
+    assert_eq!(response.messages.len(), 3);
+
+    // 1. SeiMsg::CreateDenom
+    assert_eq!(
+        response.messages[0].msg,
+        CosmosMsg::Custom(SeiMsg::CreateDenom {
+            subdenom: "3QEQyi7iyJHwQ4wfUMLFPB4kRzczMAXCitWh7h6TETDa".to_string()
+        })
+    );
+
+    // 2. SeiMsg::MintTokens
+    let expected_coin = coin(amount, tokenfactory_denom);
+    assert_eq!(
+        response.messages[1].msg,
+        CosmosMsg::Custom(SeiMsg::MintTokens {
+            amount: expected_coin.clone()
+        })
+    );
+
+    // 3. BankMsg::Send
+    assert_eq!(
+        response.messages[2].msg,
+        CosmosMsg::Bank(BankMsg::Send {
+            to_address: recipient,
+            amount: vec![expected_coin]
+        })
+    );
+}
+
 // 3. Failure: couldn't validate recipient address
+#[test]
+fn convert_cw20_to_bank_failure_invalid_recipient() {
+    let mut deps = default_custom_mock_deps();
+    let env = mock_env();
+    let recipient = "badSeiAddress".to_string();
+    let amount = 1;
+    let contract_addr = "badContractAddr".to_string();
+
+    let method_err =
+        convert_cw20_to_bank(deps.as_mut(), env, recipient, amount, contract_addr).unwrap_err();
+    assert_eq!(
+        method_err.to_string(),
+        "invalid recipient address badSeiAddress"
+    );
+}
+
 // 4. Failure: couldn't validate contract address
-// 5. Failure: contract_addr_to_base58 method failure
-// 6. Failure: couldn't save contract addr => tokenfactory mapping to storage
+#[test]
+fn convert_cw20_to_bank_failure_invalid_contract() {
+    let mut deps = default_custom_mock_deps();
+    let env = mock_env();
+    let recipient = SEI_USER_ADDR.to_string();
+    let amount = 1;
+    let contract_addr = "badContractAddr".to_string();
+
+    let method_err =
+        convert_cw20_to_bank(deps.as_mut(), env, recipient, amount, contract_addr).unwrap_err();
+    assert_eq!(
+        method_err.to_string(),
+        "invalid contract address badContractAddr"
+    );
+}
 
 // TESTS: reply
 // 1. Happy path: REPLY ID matches
@@ -263,9 +494,18 @@ fn parse_bank_token_factory_contract_happy_path() {
     let mut deps = default_custom_mock_deps();
     let env = mock_env();
 
-    let tokenfactory_denom = format!("factory/{}/{}", MOCK_CONTRACT_ADDR, "3QEQyi7iyJHwQ4wfUMLFPB4kRzczMAXCitWh7h6TETDa");
+    let tokenfactory_denom = format!(
+        "factory/{}/{}",
+        MOCK_CONTRACT_ADDR, "3QEQyi7iyJHwQ4wfUMLFPB4kRzczMAXCitWh7h6TETDa"
+    );
     let coin = Coin::new(100, tokenfactory_denom.clone());
-    CW_DENOMS.save(deps.as_mut().storage, SEI_CONTRACT_ADDR.to_string(), &tokenfactory_denom).unwrap();
+    CW_DENOMS
+        .save(
+            deps.as_mut().storage,
+            SEI_CONTRACT_ADDR.to_string(),
+            &tokenfactory_denom,
+        )
+        .unwrap();
 
     let contract_addr = parse_bank_token_factory_contract(deps.as_mut(), env, coin).unwrap();
     assert_eq!(contract_addr, SEI_CONTRACT_ADDR);
@@ -312,7 +552,10 @@ fn parse_bank_token_factory_contract_failure_base58_decode_failure() {
     let coin = Coin::new(100, format!("factory/{}/denom0", MOCK_CONTRACT_ADDR));
 
     let method_err = parse_bank_token_factory_contract(deps.as_mut(), env, coin).unwrap_err();
-    assert_eq!(method_err.to_string(), "failed to decode base58 subdenom denom0");
+    assert_eq!(
+        method_err.to_string(),
+        "failed to decode base58 subdenom denom0"
+    );
 }
 
 // 6. Failure: the parsed contract address is not in CW_DENOMS storage
@@ -320,10 +563,19 @@ fn parse_bank_token_factory_contract_failure_base58_decode_failure() {
 fn parse_bank_token_factory_contract_failure_no_storage() {
     let mut deps = default_custom_mock_deps();
     let env = mock_env();
-    let coin = Coin::new(100, format!("factory/{}/{}", MOCK_CONTRACT_ADDR, "3QEQyi7iyJHwQ4wfUMLFPB4kRzczMAXCitWh7h6TETDa"));
+    let coin = Coin::new(
+        100,
+        format!(
+            "factory/{}/{}",
+            MOCK_CONTRACT_ADDR, "3QEQyi7iyJHwQ4wfUMLFPB4kRzczMAXCitWh7h6TETDa"
+        ),
+    );
 
     let method_err = parse_bank_token_factory_contract(deps.as_mut(), env, coin).unwrap_err();
-    assert_eq!(method_err.to_string(), "a corresponding denom for the extracted contract addr is not contained in storage");
+    assert_eq!(
+        method_err.to_string(),
+        "a corresponding denom for the extracted contract addr is not contained in storage"
+    );
 }
 
 // 7. Failure: the stored denom doesn't equal the coin's denom
@@ -331,12 +583,27 @@ fn parse_bank_token_factory_contract_failure_no_storage() {
 fn parse_bank_token_factory_contract_failure_storage_mismatch() {
     let mut deps = default_custom_mock_deps();
     let env = mock_env();
-    let coin = Coin::new(100, format!("factory/{}/{}", MOCK_CONTRACT_ADDR, "3QEQyi7iyJHwQ4wfUMLFPB4kRzczMAXCitWh7h6TETDa"));
+    let coin = Coin::new(
+        100,
+        format!(
+            "factory/{}/{}",
+            MOCK_CONTRACT_ADDR, "3QEQyi7iyJHwQ4wfUMLFPB4kRzczMAXCitWh7h6TETDa"
+        ),
+    );
 
-    CW_DENOMS.save(deps.as_mut().storage, SEI_CONTRACT_ADDR.to_string(), &"factory/fake/fake".to_string()).unwrap();
+    CW_DENOMS
+        .save(
+            deps.as_mut().storage,
+            SEI_CONTRACT_ADDR.to_string(),
+            &"factory/fake/fake".to_string(),
+        )
+        .unwrap();
 
     let method_err = parse_bank_token_factory_contract(deps.as_mut(), env, coin).unwrap_err();
-    assert_eq!(method_err.to_string(), "the stored denom for the contract does not match the actual coin denom");
+    assert_eq!(
+        method_err.to_string(),
+        "the stored denom for the contract does not match the actual coin denom"
+    );
 }
 
 // TESTS: contract_addr_to_base58
@@ -347,7 +614,8 @@ fn contract_addr_to_base58_happy_path() {
     let b58_str = contract_addr_to_base58(
         deps.as_ref(),
         "sei1yw4wv2zqg9xkn67zvq3azye0t8h0x9kgyg3d53jym24gxt49vdyswk5upj".to_string(),
-    ).unwrap();
+    )
+    .unwrap();
     assert_eq!(b58_str, "3QEQyi7iyJHwQ4wfUMLFPB4kRzczMAXCitWh7h6TETDa");
 }
 
@@ -359,8 +627,12 @@ fn contract_addr_from_base58_happy_path() {
     let contract_addr = contract_addr_from_base58(
         deps.as_ref(),
         "3QEQyi7iyJHwQ4wfUMLFPB4kRzczMAXCitWh7h6TETDa",
-    ).unwrap();
-    assert_eq!(contract_addr, "sei1yw4wv2zqg9xkn67zvq3azye0t8h0x9kgyg3d53jym24gxt49vdyswk5upj");
+    )
+    .unwrap();
+    assert_eq!(
+        contract_addr,
+        "sei1yw4wv2zqg9xkn67zvq3azye0t8h0x9kgyg3d53jym24gxt49vdyswk5upj"
+    );
 }
 
 // 2. Failure: could not decode base58
@@ -370,6 +642,10 @@ fn contract_addr_from_base58_failure_decode_base58() {
     let method_err = contract_addr_from_base58(
         deps.as_ref(),
         "3QEQyi7iyJHwQ4wfUMLFPB4kRzczMAXCitWh7h6TETD0",
-    ).unwrap_err();
-    assert_eq!(method_err.to_string(), "failed to decode base58 subdenom 3QEQyi7iyJHwQ4wfUMLFPB4kRzczMAXCitWh7h6TETD0")
+    )
+    .unwrap_err();
+    assert_eq!(
+        method_err.to_string(),
+        "failed to decode base58 subdenom 3QEQyi7iyJHwQ4wfUMLFPB4kRzczMAXCitWh7h6TETD0"
+    )
 }
