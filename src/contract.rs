@@ -1,7 +1,7 @@
 #[cfg(not(feature = "library"))]
 use cosmwasm_std::entry_point;
 
-use anyhow::{ensure, Context};
+use anyhow::{bail, ensure, Context};
 use cosmwasm_std::{
     coin, from_binary, to_binary, BankMsg, Binary, Coin, CosmosMsg, Deps, DepsMut, Empty, Env,
     MessageInfo, QueryRequest, Reply, Response, SubMsg, Uint128, WasmMsg, WasmQuery,
@@ -81,9 +81,8 @@ pub fn reply(deps: DepsMut, env: Env, msg: Reply) -> Result<Response<SeiMsg>, an
         return handle_complete_transfer_reply(deps, env, msg);
     }
 
-    // other cases probably from calling into the sei burn/mint messages and token factory methods
-
-    Ok(Response::default())
+    // for safety, let's error out if we don't match a reply ID
+    bail!("unmatched reply id {}", msg.id);
 }
 
 fn handle_complete_transfer_reply(
@@ -214,7 +213,10 @@ fn convert_and_transfer(
         .load(deps.storage)
         .context("could not load token bridge contract address")?;
 
-    ensure!(info.funds.len() == 1, "no bridging coin included");
+    ensure!(
+        info.funds.len() == 1,
+        "info.funds should contain only 1 coin"
+    );
     let bridging_coin = info.funds[0].clone();
     let cw20_contract_addr = parse_bank_token_factory_contract(deps, env, bridging_coin.clone())?;
 
@@ -314,7 +316,7 @@ fn parse_bank_token_factory_contract(
         "coin is not from the token factory"
     );
 
-    // decode subdenom from base64 => encode as cosmos addr to get contract addr
+    // decode subdenom from base58 => encode as cosmos addr to get contract addr
     let cw20_contract_addr = contract_addr_from_base58(deps.as_ref(), parsed_denom[2])?;
 
     // validate that the contract does indeed match the stored denom we have for it
@@ -426,3 +428,6 @@ fn contract_addr_from_base58(deps: Deps, subdenom: &str) -> Result<String, anyho
         .map(|a| a.to_string())
         .context(format!("failed to humanize cosmos address {}", subdenom))
 }
+
+#[cfg(test)]
+mod test;
